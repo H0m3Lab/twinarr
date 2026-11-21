@@ -1,0 +1,19 @@
+# Twinarr - copy to docker-compose.yml and adjust. Tracker settings and secrets go in .env (see .env.example).
+services:
+  twinarr:
+    build: .
+    image: twinarr:local
+    container_name: twinarr
+    user: "99:100"                  # any user that can write ./data; it never touches your media files
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: America/New_York
+      MODE: report                  # report = only log matches; inject = add them to qBittorrent
+      RUN_AT: "03:30"               # daily run time (container local time)
+      SEARCH_DELAY: "30"            # seconds between searches, keep it polite
+      QBIT_URL: http://qbittorrent:8080
+    volumes:
+      - /path/to/appdata/twinarr:/data   # twinarr.db (search history; small)
+    # put it on the same Docker network as qBittorrent and your indexer manager
+    # networks: [media]

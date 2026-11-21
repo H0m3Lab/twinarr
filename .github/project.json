@@ -1,0 +1,20 @@
+{
+  "name": "Twinarr",
+  "slug": "twinarr",
+  "tagline": "Seed the torrents you already have on more trackers, without downloading anything.",
+  "description": "Twinarr searches your other trackers every day for exact twins of the torrents you are seeding, and adds each match to qBittorrent pointing at the files you already have. qBittorrent verifies the data before anything seeds.",
+  "status": "early",
+  "features": [
+    "Daily search of every seeding torrent from your source trackers",
+    "Any Torznab indexer as a target (e.g. through Prowlarr)",
+    "Strict matching: same file names and sizes, byte-checked by qBittorrent",
+    "Report mode first; failed checks stay stopped",
+    "Python standard library only"
+  ],
+  "stack": ["Python", "SQLite", "Docker"],
+  "repository": "https://github.com/H0m3Lab/twinarr",
+  "documentation": "https://github.com/H0m3Lab/twinarr#readme",
+  "changelog": "https://github.com/H0m3Lab/twinarr/blob/main/CHANGELOG.md",
+  "license": "MIT",
+  "screenshots": []
+}
