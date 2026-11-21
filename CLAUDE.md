@@ -20,8 +20,15 @@ One file, `twinarr.py`:
 - `run_once`: pick sources (`pick_sources`) → query (`search_query`) → size pre-filter (`size_close`) →
   fetch `.torrent` → strict file compare (`files_match`) → add stopped + recheck (inject mode).
 - `settle_checks`: starts twins that verified 100%, tags the rest `<TAG>-mismatch` and leaves them stopped.
-- `main`: `daemon` (sleep until `RUN_AT`, run, repeat), `once`, `status`.
-- SQLite `twinarr.db` in `DATA_DIR`: `searches` (last outcome per source+target) and `twins`.
+- `do_run`: one guarded pass (`RUN_LOCK`), recorded in the `runs` table; `scheduler` thread fires it at
+  the saved run time; the web **Run now** button starts it in a thread.
+- Web UI (`Web`, `ThreadingHTTPServer`, port `UI_PORT` 8383): `status_page`, `settings_page` /
+  `save_settings` (lists `tracker_hosts` from qBittorrent and `prowlarr_indexers`), `/run`, `/health`.
+  Optional basic auth (`UI_PASSWORD`); POSTs need a same-origin `Origin`/`Referer`.
+- Settings: `Config(saved)` reads the environment, then values saved on the settings page (`settings`
+  table) win.
+- `main`: `daemon` (scheduler + web), `once`, `status`.
+- SQLite `twinarr.db` in `DATA_DIR`: `searches`, `twins`, `settings`, `runs`.
 
 ## Stack
 
@@ -33,7 +40,7 @@ One file, `twinarr.py`:
 
 ```
 twinarr.py                  the whole app
-tests/test_twinarr.py       unit tests (unittest, no network)
+tests/test_twinarr.py       unit tests (unittest; the web tests start a local server)
 Dockerfile                  python:3.12-slim image, entrypoint twinarr.py
 docker-compose.example.yml  copy to docker-compose.yml (git-ignored)
 .env.example                copy to .env (git-ignored): trackers, indexers, logins
@@ -60,6 +67,7 @@ or change one: update both, give it a safe default, and add a CHANGELOG line.
 
 - Standard library only; ask before adding a dependency.
 - Log every match and every failure; never log URLs without `redact()` (Torznab URLs carry API keys).
+- HTML is built with f-strings; escape every value with `esc()`.
 - Default to the safe side: `MODE=report` by default; anything unexpected skips the item.
 
 ## Data safety (do not break)
@@ -74,7 +82,9 @@ or change one: update both, give it a safe default, and add a CHANGELOG line.
 
 - Never hardcode credentials or private values (real IPs, host names, domains, keys, names, tracker
   names). Use placeholders like `tracker-a.example` / `192.0.2.10` in code, tests and docs.
-- Twinarr exposes no port. It needs outbound access to qBittorrent and the Torznab URLs only.
+- The web page has no login unless `UI_PASSWORD` is set; it is meant for a home network. Keep the
+  same-origin check on every POST, and never show API keys or tracker passkeys on a page.
+- Outbound access needed: qBittorrent, the Torznab URLs, Prowlarr (optional).
 
 ## Releases
 

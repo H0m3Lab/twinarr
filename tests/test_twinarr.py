@@ -114,5 +114,99 @@ class Config(unittest.TestCase):
         self.assertEqual(t.next_run("05:00", base), datetime(2030, 1, 1, 5, 0))
 
 
+class SavedSettings(unittest.TestCase):
+    def setUp(self):
+        self.old = dict(os.environ)
+        os.environ.update({"SOURCE_TRACKERS": "env-src.example", "TARGETS": "envt|http://idx.example/1/api",
+                           "PROWLARR_URL": "http://prowlarr.example:9696", "PROWLARR_APIKEY": "k"})
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.old)
+
+    def test_env_only(self):
+        cfg = t.Config({})
+        self.assertEqual(cfg.sources, ["env-src.example"])
+        self.assertEqual(cfg.targets, [("envt", "http://idx.example/1/api")])
+        self.assertEqual(cfg.problems(), [])
+
+    def test_saved_wins(self):
+        cfg = t.Config({"sources": "a.example,b.example", "run_at": "05:15", "mode": "inject",
+                        "targets": '[{"id": 7, "name": "Seven"}]'})
+        self.assertEqual(cfg.sources, ["a.example", "b.example"])
+        self.assertEqual(cfg.targets, [("Seven", "http://prowlarr.example:9696/7/api")])
+        self.assertEqual((cfg.run_at, cfg.mode, cfg.apikey), ("05:15", "inject", "k"))
+
+    def test_problems(self):
+        cfg = t.Config({"sources": "", "targets": "[]"})
+        self.assertEqual(len(cfg.problems()), 2)
+
+    def test_valid_time(self):
+        self.assertTrue(t.valid_time("03:30"))
+        for bad in ("24:00", "3:7", "aa:bb", ""):
+            self.assertFalse(t.valid_time(bad))
+
+
+class WebUI(unittest.TestCase):
+    """Start the real web server on a free port with a temp database (no qBittorrent needed)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import threading
+        cls.tmp = tempfile.mkdtemp()
+        cls.old = dict(os.environ)
+        os.environ.update({"SOURCE_TRACKERS": "", "TARGETS": "", "QBIT_URL": "http://127.0.0.1:9",
+                           "UI_PASSWORD": "pw"})
+        os.environ.pop("PROWLARR_URL", None)
+        t.DB_PATH = os.path.join(cls.tmp, "twinarr.db")
+        t.db_conn().close()
+        cls.srv = t.ThreadingHTTPServer(("127.0.0.1", 0), t.Web)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        os.environ.clear()
+        os.environ.update(cls.old)
+
+    def req(self, path, data=None, auth=True, origin=True):
+        import base64
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        h = {}
+        if auth:
+            h["Authorization"] = "Basic " + base64.b64encode(b"x:pw").decode()
+        if origin:
+            h["Origin"] = self.base
+        body = urllib.parse.urlencode(data, doseq=True).encode() if data is not None else None
+        try:
+            with urllib.request.urlopen(urllib.request.Request(self.base + path, data=body, headers=h)) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_auth_and_pages(self):
+        self.assertEqual(self.req("/", auth=False)[0], 401)
+        self.assertEqual(self.req("/health", auth=False)[0], 200)
+        code, body = self.req("/")
+        self.assertEqual(code, 200)
+        self.assertIn("Not set up", body)
+        code, body = self.req("/settings")
+        self.assertEqual(code, 200)
+        self.assertIn("Could not read qBittorrent", body)
+
+    def test_settings_post(self):
+        self.assertEqual(self.req("/settings", {"run_at": "04:45", "mode": "report"}, origin=False)[0], 403)
+        code, body = self.req("/settings", {"run_at": "04:45", "mode": "inject", "src": ["One.Example"],
+                                            "src_extra": "two.example, bad host!"})
+        self.assertIn("Saved.", body)
+        cfg = t.current_config()
+        self.assertEqual((cfg.run_at, cfg.mode, cfg.sources), ("04:45", "inject", ["one.example", "two.example"]))
+        self.assertIn("Not saved", self.req("/settings", {"run_at": "99:00", "mode": "report"})[1])
+
+
 if __name__ == "__main__":
     unittest.main()

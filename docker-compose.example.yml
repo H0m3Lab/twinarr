@@ -7,12 +7,14 @@ services:
     user: "99:100"                  # any user that can write ./data; it never touches your media files
     restart: unless-stopped
     env_file: .env
+    ports: ["8383:8383"]            # web page: status, settings, Run now (home network only, or set UI_PASSWORD)
     environment:
       TZ: America/New_York
-      MODE: report                  # report = only log matches; inject = add them to qBittorrent
-      RUN_AT: "03:30"               # daily run time (container local time)
+      MODE: report                  # starting value; change it on the settings page
+      RUN_AT: "03:30"               # starting value; change it on the settings page
       SEARCH_DELAY: "30"            # seconds between searches, keep it polite
       QBIT_URL: http://qbittorrent:8080
+      PROWLARR_URL: http://prowlarr:9696   # lets the settings page list your indexers
     volumes:
       - /path/to/appdata/twinarr:/data   # twinarr.db (search history; small)
     # put it on the same Docker network as qBittorrent and your indexer manager

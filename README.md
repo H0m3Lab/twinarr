@@ -20,7 +20,14 @@ Every seeding torrent is searched again every day, however old it is. If a twin 
 after your grab, the next daily run finds it. Torrents already in qBittorrent (added by Twinarr, by
 another tool or by hand) are recognized by their info-hash and skipped from then on.
 
-Twinarr is one Python file, standard library only, with a small SQLite history.
+Twinarr is one Python file, standard library only, with a small SQLite history and a built-in
+web page (port 8383):
+
+- **Status:** next and last run, a **Run now** button, every twin it added (site, status) and the run
+  history.
+- **Settings:** the daily run time, report or inject mode, and the sites. **Main** lists the trackers
+  your qBittorrent torrents come from (with counts): tick the one(s) you download from. **Reseed to**
+  lists your Prowlarr indexers: tick the sites to look for twins on.
 
 ## Install
 
@@ -32,15 +39,19 @@ docker compose up -d --build
 docker compose logs -f twinarr
 ```
 
-It starts in **report mode**: it searches and logs `MATCH ...` lines but adds nothing. Run one pass
-right away instead of waiting for `RUN_AT`:
+Open `http://<server>:8383`, pick your sites on **Settings**, and press **Run now** on the status
+page. It starts in **report mode**: it searches and logs `MATCH ...` lines but adds nothing. From the
+command line:
 
 ```bash
 docker compose run --rm twinarr once
 docker compose run --rm twinarr status   # searches by outcome, twins by status
 ```
 
-When the matches look right, set `MODE: inject` and restart.
+When the matches look right, switch the mode to **inject** on the settings page.
+
+Values saved on the settings page (run time, mode, main trackers, reseed-to sites) are stored in
+`twinarr.db` and win over the environment variables below, which are the starting defaults.
 
 ### Requirements
 
@@ -54,9 +65,12 @@ When the matches look right, set `MODE: inject` and restart.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PROWLARR_URL` / `PROWLARR_APIKEY` | empty | Lets the settings page list your Prowlarr indexers to reseed to |
+| `UI_PORT` | `8383` | Web page port |
+| `UI_PASSWORD` | empty | If set, the web page asks for it (any user name). Without it, keep the port on your home network |
 | `MODE` | `report` | `report` = log matches only; `inject` = add them to qBittorrent |
-| `SOURCE_TRACKERS` | (required) | Parts of announce host names, comma separated. Seeding torrents from these get searched |
-| `TARGETS` | (required) | `name\|torznab_url`, comma separated. The indexers to search |
+| `SOURCE_TRACKERS` | empty | Parts of announce host names, comma separated. Seeding torrents from these get searched |
+| `TARGETS` | empty | `name\|torznab_url`, comma separated. The indexers to search, if you don't pick them from Prowlarr |
 | `TORZNAB_APIKEY` | empty | Added as `apikey=` to every Torznab request (e.g. your Prowlarr API key) |
 | `QBIT_URL` | `http://qbittorrent:8080` | qBittorrent WebUI |
 | `QBIT_USER` / `QBIT_PASS` | empty | WebUI login. Leave empty if the WebUI skips auth for Twinarr's network |
@@ -93,6 +107,9 @@ cross-seeding. Most do. Some limit API calls per day.
 
 ## Troubleshooting
 
+- **The page says "Not set up"**: no main tracker or no reseed-to site is picked yet. Open Settings.
+- **Settings shows "Could not read Prowlarr"**: check `PROWLARR_URL` (reachable from the container)
+  and `PROWLARR_APIKEY` (Prowlarr → Settings → General).
 - **`qBittorrent login failed`**: check `QBIT_USER` / `QBIT_PASS`, and that `QBIT_URL` is reachable
   from the container's network.
 - **`0 torrents seeding from source trackers`**: `SOURCE_TRACKERS` is matched against the announce
