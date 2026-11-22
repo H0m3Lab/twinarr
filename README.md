@@ -15,6 +15,9 @@ Every day Twinarr:
    data check,
 5. starts it only if the check says 100%. Anything else stays stopped and gets the tag
    `twinarr-mismatch`, so qBittorrent never downloads a single byte.
+6. gives the twin the seed limits of the Prowlarr indexer it came from (seed ratio, seed time, pack seed
+   time), so qBittorrent stops it at that site's rule. Empty values, and targets that aren't Prowlarr
+   indexers, use qBittorrent's global limits.
 
 Every seeding torrent is searched again every day, however old it is. If a twin is uploaded weeks
 after your grab, the next daily run finds it. Torrents already in qBittorrent (added by Twinarr, by

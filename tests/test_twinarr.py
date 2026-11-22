@@ -97,6 +97,28 @@ class Torznab(unittest.TestCase):
             t.parse_torznab(b'<error code="100" description="Invalid API Key"/>')
 
 
+class SeedLimits(unittest.TestCase):
+    def test_from_prowlarr_fields(self):
+        f = [{"name": "torrentBaseSettings.seedRatio", "value": 2},
+             {"name": "torrentBaseSettings.seedTime", "value": 600},
+             {"name": "torrentBaseSettings.packSeedTime", "value": None}, {"name": "x", "value": 1}]
+        self.assertEqual(t.seed_limits_from_fields(f), (2, 600, 600))
+        self.assertEqual(t.seed_limits_from_fields([]), (None, None, None))
+
+    def test_share_limits(self):
+        lim = (1, 2880, 8640)
+        self.assertEqual(t.share_limits_for(lim, {"a.mkv": 1, "a.nfo": 1}), (1.0, 2880))
+        self.assertEqual(t.share_limits_for(lim, {"S01/e1.mkv": 1, "S01/e2.mkv": 1}), (1.0, 8640))
+        self.assertEqual(t.share_limits_for((1, None, None), {"a.mkv": 1}), (1.0, -2))
+        self.assertIsNone(t.share_limits_for((None, None, None), {"a.mkv": 1}))
+        self.assertIsNone(t.share_limits_for(None, {"a.mkv": 1}))
+
+    def test_only_prowlarr_targets(self):
+        cfg = t.Config({"sources": "tracker-a.example"})
+        cfg.prowlarr_url, cfg.prowlarr_key = "http://192.0.2.10:9696", "k"
+        self.assertIsNone(t.prowlarr_seed_limits(cfg, "http://192.0.2.20/api"))
+
+
 class Config(unittest.TestCase):
     def test_targets(self):
         self.assertEqual(t.parse_targets("one|http://p.example/1/api, two|https://p.example/2/api"),

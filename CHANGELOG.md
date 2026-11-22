@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+### Added
+- New twins get the seed limits of the Prowlarr indexer they came from (seed ratio, seed time, and
+  pack seed time when the twin has more than one video file), so qBittorrent stops them at that
+  site's rule instead of the global limit. Values left empty in Prowlarr use qBittorrent's global
+  limit. Targets that are not Prowlarr indexers keep the global limits.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

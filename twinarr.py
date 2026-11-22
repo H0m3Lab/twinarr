@@ -31,11 +31,12 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
 TORZNAB_NS = "{http://torznab.com/schemas/2015/feed}"
+VIDEO_EXT = re.compile(r"\.(mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|mpe?g)$", re.I)
 
 log = logging.getLogger("twinarr")
 
@@ -366,6 +367,49 @@ class QBit:
     def add_tags(self, h, tags):
         self._req("/api/v2/torrents/addTags", data={"hashes": h, "tags": tags}, raw=True)
 
+    def set_share_limits(self, h, ratio, minutes):
+        """Per-torrent seed limits; -2 = use qBittorrent's global limit. The stop/remove action
+        stays the global one (qBittorrent 5.x needs the last two fields)."""
+        self._req("/api/v2/torrents/setShareLimits", raw=True, data={
+            "hashes": h, "ratioLimit": ratio, "seedingTimeLimit": minutes, "inactiveSeedingTimeLimit": -2,
+            "shareLimitAction": "Default", "shareLimitsMode": "Default"})
+
+
+# --------------------------------------------------------------------------- seed limits
+
+def seed_limits_from_fields(fields):
+    """Prowlarr indexer fields -> (ratio, minutes, pack_minutes); None = not set.
+    An empty pack time falls back to the normal seed time, as Sonarr does."""
+    f = {x.get("name"): x.get("value") for x in fields}
+    ratio = f.get("torrentBaseSettings.seedRatio")
+    minutes = f.get("torrentBaseSettings.seedTime")
+    pack = f.get("torrentBaseSettings.packSeedTime")
+    return ratio, minutes, pack if pack is not None else minutes
+
+
+def share_limits_for(limits, files):
+    """(ratio, minutes) for qBittorrent, -2 for 'global'; None when nothing is set."""
+    if not limits:
+        return None
+    ratio, minutes, pack = limits
+    videos = [n for n in files if VIDEO_EXT.search(n)]
+    minutes = pack if len(videos) > 1 else minutes
+    out = (-2 if ratio is None else float(ratio), -2 if minutes is None else int(minutes))
+    return None if out == (-2, -2) else out
+
+
+def prowlarr_seed_limits(cfg, target_url):
+    """Seed limits of the Prowlarr indexer behind a target URL, or None (not a Prowlarr target)."""
+    if not (cfg.prowlarr_url and cfg.prowlarr_key):
+        return None
+    m = re.fullmatch(re.escape(cfg.prowlarr_url) + r"/(\d+)/api", target_url)
+    if not m:
+        return None
+    req = urllib.request.Request(f"{cfg.prowlarr_url}/api/v1/indexer/{m.group(1)}",
+                                 headers={"X-Api-Key": cfg.prowlarr_key, "User-Agent": USER_AGENT})  # guard:allow
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return seed_limits_from_fields(json.loads(r.read()).get("fields", []))
+
 
 # --------------------------------------------------------------------------- state
 
@@ -419,6 +463,7 @@ def run_once(cfg, qb, db):
              len(sources), len(cfg.targets), cfg.mode)
     found = added = searches = 0
     first = True
+    seed_limits = {}  # target -> Prowlarr seed limits, read once per run
     for src in sources:
         files = qb.files(src["hash"])
         total = sum(files.values())
@@ -466,6 +511,7 @@ def run_once(cfg, qb, db):
                     category = cfg.category or src.get("category", "")
                     qb.add_stopped(data, src["save_path"], category, cfg.tag)
                     time.sleep(2)
+                    apply_seed_limits(cfg, qb, seed_limits, target, url, h, files)
                     qb.recheck(h)
                     known.add(h)
                     db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
@@ -480,6 +526,20 @@ def run_once(cfg, qb, db):
     if added:
         settle_checks(cfg, qb, db)
     return {"sources": len(sources), "searches": searches, "matches": found, "added": added}
+
+
+def apply_seed_limits(cfg, qb, cache, target, url, h, files):
+    """Give a new twin the seed ratio/time its Prowlarr indexer has; on any error the twin
+    keeps qBittorrent's global limits (logged, never fatal)."""
+    try:
+        if target not in cache:
+            cache[target] = prowlarr_seed_limits(cfg, url)
+        limits = share_limits_for(cache[target], files)
+        if limits:
+            qb.set_share_limits(h, *limits)
+            log.info("[%s] seed limits ratio %s / %s min", target, *limits)
+    except Exception as e:
+        log.warning("[%s] could not set seed limits (global limits apply): %s", target, redact(str(e)))
 
 
 def settle_checks(cfg, qb, db):
