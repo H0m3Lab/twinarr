@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-23
+
+### Fixed
+
+- qBittorrent 5.1+ answers a torrent add with JSON (`success_count` ...) instead of `Ok.`; Twinarr took that as a refusal and stopped the run, leaving the new twin stopped and unchecked.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added
@@ -36,6 +42,8 @@ All notable changes to this project are documented here. The format follows
   Torznab target indexers, strict file-by-file matching, report and inject modes, data check before
   seeding (mismatches stay stopped), SQLite search history, `status` command.
 
-[Unreleased]: https://github.com/H0m3Lab/twinarr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/H0m3Lab/twinarr/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/H0m3Lab/twinarr/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/H0m3Lab/twinarr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/H0m3Lab/twinarr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/H0m3Lab/twinarr/releases/tag/v0.1.0

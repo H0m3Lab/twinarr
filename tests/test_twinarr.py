@@ -119,6 +119,16 @@ class SeedLimits(unittest.TestCase):
         self.assertIsNone(t.prowlarr_seed_limits(cfg, "http://192.0.2.20/api"))
 
 
+class QBitAdd(unittest.TestCase):
+    def test_add_responses(self):
+        self.assertTrue(t.add_accepted(b"Ok."))
+        self.assertTrue(t.add_accepted(b""))
+        self.assertTrue(t.add_accepted(b'{"added_torrent_ids":["ab"],"failure_count":0,"pending_count":0,"success_count":1}'))
+        self.assertTrue(t.add_accepted(b'{"failure_count":0,"pending_count":1,"success_count":0}'))
+        self.assertFalse(t.add_accepted(b'{"failure_count":1,"pending_count":0,"success_count":0}'))
+        self.assertFalse(t.add_accepted(b"Fails."))
+
+
 class Config(unittest.TestCase):
     def test_targets(self):
         self.assertEqual(t.parse_targets("one|http://p.example/1/api, two|https://p.example/2/api"),

@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
@@ -296,6 +296,23 @@ def torznab_search(base_url, apikey, query):
 
 # --------------------------------------------------------------------------- qBittorrent
 
+def add_accepted(body):
+    """True when qBittorrent accepted /torrents/add.
+
+    4.x answers "Ok." (older 5.x an empty body); newer 5.x answers JSON like
+    {"success_count":1,"failure_count":0,"pending_count":0,"added_torrent_ids":[...]}.
+    """
+    body = (body or b"").strip()
+    if body in (b"Ok.", b""):
+        return True
+    try:
+        res = json.loads(body)
+    except ValueError:
+        return False
+    return (isinstance(res, dict) and not res.get("failure_count")
+            and (res.get("success_count", 0) + res.get("pending_count", 0)) > 0)
+
+
 class QBit:
     def __init__(self, url, user, password):
         self.url = url
@@ -350,7 +367,7 @@ class QBit:
         parts.append(f"--{boundary}--\r\n".encode())
         body = self._req("/api/v2/torrents/add", data=b"".join(parts), raw=True,
                          headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        if body.strip() not in (b"Ok.", b""):
+        if not add_accepted(body):
             raise RuntimeError(f"qBittorrent refused the torrent: {body[:200]!r}")
 
     def recheck(self, h):
