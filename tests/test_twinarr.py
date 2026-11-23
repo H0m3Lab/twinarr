@@ -129,6 +129,57 @@ class QBitAdd(unittest.TestCase):
         self.assertFalse(t.add_accepted(b"Fails."))
 
 
+class FakeQB:
+    """qBittorrent stand-in for settle_checks: each recheck finishes at once with the next result."""
+    def __init__(self, results):
+        self.results = list(results)  # progress after each recheck
+        self.progress = self.results.pop(0)
+        self.started = self.rechecks = 0
+        self.tags = []
+
+    def torrents(self, hashes=None):
+        return [{"hash": "aa", "name": "Show.S01E01", "progress": self.progress,
+                 "state": "stoppedUP" if self.progress >= 1 else "stoppedDL"}]
+
+    def recheck(self, h):
+        self.rechecks += 1
+        self.progress = self.results.pop(0)
+
+    def start(self, h):
+        self.started += 1
+
+    def add_tags(self, h, tag):
+        self.tags.append(tag)
+
+
+class SettleChecks(unittest.TestCase):
+    def settle(self, results):
+        db = t.open_db(":memory:")
+        db.execute("INSERT INTO twins VALUES ('aa','bb','SiteA','Show.S01E01','2026-01-01T00:00:00','checking')")
+        qb = FakeQB(results)
+        cfg = t.Config({})
+        cfg.check_timeout = 60
+        orig, t.time.sleep = t.time.sleep, lambda s: None
+        try:
+            t.settle_checks(cfg, qb, db)
+        finally:
+            t.time.sleep = orig
+        return qb, db.execute("SELECT status FROM twins").fetchone()[0]
+
+    def test_lost_check_gets_one_more(self):
+        qb, status = self.settle([0.0, 1.0])  # first check never ran, second verifies
+        self.assertEqual((status, qb.rechecks, qb.started), ("seeding", 1, 1))
+
+    def test_real_mismatch_stays_stopped(self):
+        qb, status = self.settle([0.4, 0.4])
+        self.assertEqual((status, qb.rechecks, qb.started), ("mismatch", 1, 0))
+        self.assertEqual(len(qb.tags), 1)
+
+    def test_good_twin_no_extra_check(self):
+        qb, status = self.settle([1.0])
+        self.assertEqual((status, qb.rechecks, qb.started), ("seeding", 0, 1))
+
+
 class Config(unittest.TestCase):
     def test_targets(self):
         self.assertEqual(t.parse_targets("one|http://p.example/1/api, two|https://p.example/2/api"),

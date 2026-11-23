@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
@@ -487,7 +487,7 @@ def run_once(cfg, qb, db):
         query = search_query(src["name"])
         for target, url in cfg.targets:
             # already twinned on this target (by Twinarr or by hand): nothing left to find
-            if db.execute("SELECT 1 FROM twins WHERE source_hash=? AND target=? COLLATE NOCASE AND status IN ('seeding','checking')",
+            if db.execute("SELECT 1 FROM twins WHERE source_hash=? AND target=? COLLATE NOCASE AND status IN ('seeding','checking','rechecking')",
                           (src["hash"], target)).fetchone() or \
                     db.execute("SELECT 1 FROM searches WHERE source_hash=? AND target=? COLLATE NOCASE AND outcome='already-in-client'",
                                (src["hash"], target)).fetchone():
@@ -560,10 +560,14 @@ def apply_seed_limits(cfg, qb, cache, target, url, h, files):
 
 
 def settle_checks(cfg, qb, db):
-    """Start twins that verified 100%; leave the rest stopped and tag them."""
+    """Start twins that verified 100%; leave the rest stopped and tag them.
+
+    A twin below 100% gets ONE more recheck before it counts as a mismatch: a recheck
+    request can be lost (qBittorrent restarted or busy), which leaves a good twin at 0%."""
     deadline = time.time() + cfg.check_timeout
     while True:
-        pending = [r[0] for r in db.execute("SELECT twin_hash FROM twins WHERE status='checking'")]
+        status = dict(db.execute("SELECT twin_hash, status FROM twins WHERE status IN ('checking','rechecking')"))
+        pending = list(status)
         if not pending:
             return
         info = {t["hash"].lower(): t for t in qb.torrents("|".join(pending))}
@@ -577,6 +581,10 @@ def settle_checks(cfg, qb, db):
                 qb.start(h)
                 db.execute("UPDATE twins SET status='seeding' WHERE twin_hash=?", (h,))
                 log.info("verified 100%%, seeding: %s", t["name"])
+            elif status[h] == "checking":
+                qb.recheck(h)
+                db.execute("UPDATE twins SET status='rechecking' WHERE twin_hash=?", (h,))
+                log.info("data check %.1f%%, checking once more: %s", t.get("progress", 0) * 100, t["name"])
             else:
                 qb.add_tags(h, cfg.tag + "-mismatch")
                 db.execute("UPDATE twins SET status='mismatch' WHERE twin_hash=?", (h,))
@@ -723,6 +731,7 @@ input[type=text],input[type=time],select{padding:6px;border:1px solid var(--line
 button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer}button:disabled{opacity:.5;cursor:default}"""
 
 STATUS_LABEL = {"seeding": ("ok", "seeding"), "checking": ("mut", "checking data"),
+                "rechecking": ("mut", "checking data again"),
                 "mismatch": ("bad", "data check failed, stopped"), "gone": ("mut", "removed from client")}
 
 
