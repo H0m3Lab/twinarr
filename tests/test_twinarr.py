@@ -1,6 +1,7 @@
 import hashlib
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 
@@ -178,6 +179,35 @@ class SettleChecks(unittest.TestCase):
     def test_good_twin_no_extra_check(self):
         qb, status = self.settle([1.0])
         self.assertEqual((status, qb.rechecks, qb.started), ("seeding", 0, 1))
+
+    def test_failed_run_still_starts_its_twins(self):
+        """A run that times out after adding a twin must still start it, not leave it for tomorrow."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "twinarr.db")
+        qb = FakeQB([1.0])
+        cfg = t.Config({})
+        cfg.check_timeout = 60
+        cfg.problems = lambda: []
+
+        def failing_run(cfg, qb, db):
+            db.execute("INSERT INTO twins VALUES ('aa','bb','SiteA','Show.S01E01','2026-01-01T00:00:00','checking')")
+            db.commit()
+            raise TimeoutError("timed out")
+
+        saved = (t.DB_PATH, t.current_config, t.QBit, t.run_once, t.time.sleep)
+        t.DB_PATH, t.current_config = path, lambda c=None: cfg
+        t.QBit, t.run_once, t.time.sleep = (lambda *a: qb), failing_run, (lambda s: None)
+        try:
+            with self.assertLogs("twinarr", level="ERROR"):
+                t.do_run("test")
+        finally:
+            t.DB_PATH, t.current_config, t.QBit, t.run_once, t.time.sleep = saved
+        db = t.open_db(path)
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT status FROM twins").fetchone()[0], "seeding")
+        self.assertEqual(qb.started, 1)
+        self.assertIn("timed out", db.execute("SELECT error FROM runs").fetchone()[0])
 
 
 class Config(unittest.TestCase):

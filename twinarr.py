@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
@@ -540,8 +540,6 @@ def run_once(cfg, qb, db):
             db.commit()
     log.info("run done: %d match(es), %d added%s", found, added,
              "" if cfg.mode == "inject" else " (report mode: nothing added)")
-    if added:
-        settle_checks(cfg, qb, db)
     return {"sources": len(sources), "searches": searches, "matches": found, "added": added}
 
 
@@ -656,7 +654,14 @@ def do_run(trigger):
             raise RuntimeError("not set up: " + "; ".join(probs))
         qb = QBit(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass)
         settle_checks(cfg, qb, c)  # twins left checking by an earlier run
-        st = run_once(cfg, qb, c)
+        try:
+            st = run_once(cfg, qb, c)
+        finally:
+            # Also after a failed run: twins it already added must not wait a day to start.
+            try:
+                settle_checks(cfg, qb, c)
+            except Exception as e:
+                log.warning("could not settle new twins, next run settles them: %s", redact(str(e)))
         c.execute("UPDATE runs SET finished_at=?, sources=?, searches=?, matches=?, added=? WHERE id=?",
                   (now(), st["sources"], st["searches"], st["matches"], st["added"], rid))
         c.commit()

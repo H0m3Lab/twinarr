@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-24
+
+### Fixed
+
+- A run that failed part-way (for example a request that timed out) skipped the step that starts verified twins, so twins it had already added sat stopped ("Completed") until the next day's run. The settle step now also runs after a failed run.
+
 ## [0.3.2] - 2026-11-23
 
 ### Fixed
