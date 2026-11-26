@@ -82,6 +82,7 @@ Values saved on the settings page (run time, mode, main trackers, reseed-to site
 | `TAG` | `twinarr` | Tag on every added torrent; failed checks get `<TAG>-mismatch` |
 | `INJECT_CATEGORY` | empty | Category for added torrents. Empty = same category as the source torrent |
 | `CHECK_TIMEOUT` | `1800` | Seconds to wait for data checks after a run; leftovers are settled on the next run |
+| `QBIT_TIMEOUT` | `300` | Seconds to wait for each qBittorrent answer; a call that times out is tried 3 times (qBittorrent can stop answering for minutes while it checks a big file) |
 | `DATA_DIR` | `/data` | Where `twinarr.db` lives |
 | `LOG_LEVEL` | `INFO` | Python log level |
 

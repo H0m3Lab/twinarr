@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -208,6 +209,124 @@ class SettleChecks(unittest.TestCase):
         self.assertEqual(db.execute("SELECT status FROM twins").fetchone()[0], "seeding")
         self.assertEqual(qb.started, 1)
         self.assertIn("timed out", db.execute("SELECT error FROM runs").fetchone()[0])
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class BusyOpener:
+    """Times out `stalls` times, then answers."""
+    def __init__(self, stalls, body=b"[]"):
+        self.stalls, self.body, self.calls = stalls, body, 0
+
+    def open(self, req, timeout=None):
+        self.calls += 1
+        if self.calls <= self.stalls:
+            raise t.urllib.error.URLError(TimeoutError("timed out"))
+        return FakeResponse(self.body)
+
+
+class BusyQBit(unittest.TestCase):
+    def call(self, stalls, retry=True):
+        qb = t.QBit("http://qbit.example", "", "", timeout=1)
+        qb.opener = BusyOpener(stalls)
+        orig, t.time.sleep = t.time.sleep, lambda s: None
+        try:
+            with self.assertLogs("twinarr", level="WARNING") if stalls and retry else nullcontext():
+                return qb, qb._req("/api/v2/torrents/info", retry=retry)
+        finally:
+            t.time.sleep = orig
+
+    def test_busy_qbit_is_asked_again(self):
+        qb, res = self.call(2)
+        self.assertEqual((res, qb.opener.calls), ([], 3))
+
+    def test_gives_up_after_retries(self):
+        with self.assertRaises(t.urllib.error.URLError):
+            self.call(5)
+
+    def test_no_retry_when_asked(self):
+        with self.assertRaises(t.urllib.error.URLError):
+            self.call(1, retry=False)
+
+
+class InjectQB:
+    """qBittorrent stand-in for inject_twin / apply_seed_limits."""
+    def __init__(self, add_times_out=False, appears=True, lost_limit_sets=0):
+        self.add_times_out, self.appears = add_times_out, appears
+        self.lost = lost_limit_sets
+        self.limit_sets = self.rechecks = 0
+        self.limits = (-2, -2)
+
+    def add_stopped(self, *a):
+        if self.add_times_out:
+            raise TimeoutError("timed out")
+
+    def wait_for(self, h, seconds):
+        return {"hash": h} if self.appears else None
+
+    def torrents(self, hashes=None):
+        return [{"hash": "aa", "ratio_limit": self.limits[0], "seeding_time_limit": self.limits[1]}]
+
+    def set_share_limits(self, h, ratio, minutes):
+        self.limit_sets += 1
+        if self.limit_sets > self.lost:
+            self.limits = (ratio, minutes)
+
+    def recheck(self, h):
+        self.rechecks += 1
+
+
+class InjectTwin(unittest.TestCase):
+    SRC = {"hash": "bb", "name": "Show.S01E01", "save_path": "/media/tv", "category": "tv"}
+    FILES = {"Show.S01E01.mkv": 100}
+
+    def inject(self, qb):
+        db = t.open_db(":memory:")
+        cfg = t.Config({})
+        cfg.qbit_timeout = 1
+        cache = {"SiteA": (1.0, 4320, 4320)}  # seed limits, no Prowlarr lookup
+        orig, t.time.sleep = t.time.sleep, lambda s: None
+        try:
+            with self.assertLogs("twinarr", level="INFO"):
+                t.inject_twin(cfg, qb, db, cache, "SiteA", "http://idx.example/1/api",
+                              self.SRC, b"", "aa", self.FILES)
+        finally:
+            t.time.sleep = orig
+            self.rows = db.execute("SELECT twin_hash, status FROM twins").fetchall()
+
+    def test_normal_add(self):
+        qb = InjectQB()
+        self.inject(qb)
+        self.assertEqual((self.rows, qb.rechecks, qb.limits), ([("aa", "checking")], 1, (1.0, 4320)))
+
+    def test_timed_out_add_that_was_accepted_is_finished(self):
+        """qBittorrent too busy to answer the add, but it took the twin: limits, recheck, record."""
+        qb = InjectQB(add_times_out=True)
+        self.inject(qb)
+        self.assertEqual((self.rows, qb.rechecks, qb.limits), ([("aa", "checking")], 1, (1.0, 4320)))
+
+    def test_timed_out_add_that_never_appears_fails(self):
+        qb = InjectQB(add_times_out=True, appears=False)
+        with self.assertRaises(TimeoutError):
+            self.inject(qb)
+        self.assertEqual((self.rows, qb.rechecks), ([], 0))
+
+    def test_lost_seed_limits_are_sent_again(self):
+        qb = InjectQB(lost_limit_sets=1)
+        self.inject(qb)
+        self.assertEqual((qb.limit_sets, qb.limits), (2, (1.0, 4320)))
 
 
 class Config(unittest.TestCase):

@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
@@ -101,6 +101,8 @@ class Config:
         self.tag = env("TAG", "twinarr")
         self.category = env("INJECT_CATEGORY")  # empty = same category as the source torrent
         self.check_timeout = int(env("CHECK_TIMEOUT", "1800"))
+        # qBittorrent can stop answering for minutes while it hash-checks a big file
+        self.qbit_timeout = int(env("QBIT_TIMEOUT", "300"))
         self.data_dir = env("DATA_DIR", "/data")
         self.ui_port = int(env("UI_PORT", "8383"))
         self.ui_password = env("UI_PASSWORD")
@@ -313,9 +315,18 @@ def add_accepted(body):
             and (res.get("success_count", 0) + res.get("pending_count", 0)) > 0)
 
 
+def is_timeout(e):
+    """True for a request that timed out (raised directly or wrapped in a URLError)."""
+    return isinstance(e, TimeoutError) or (isinstance(e, urllib.error.URLError)
+                                           and isinstance(e.reason, TimeoutError))
+
+
 class QBit:
-    def __init__(self, url, user, password):
+    RETRIES = 3  # attempts per request when qBittorrent is too busy to answer
+
+    def __init__(self, url, user, password, timeout=300):
         self.url = url
+        self.timeout = timeout
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
         self.user, self.password = user, password
@@ -326,21 +337,44 @@ class QBit:
         body = urllib.parse.urlencode({"username": self.user, "password": self.password}).encode()
         req = urllib.request.Request(self.url + "/api/v2/auth/login", data=body,
                                      headers={"Referer": self.url, "User-Agent": USER_AGENT})
-        with self.opener.open(req, timeout=30) as r:
+        with self.opener.open(req, timeout=self.timeout) as r:
             body = r.read().strip()
         # qBittorrent 4.x answers "Ok.", 5.x answers 204 with an empty body; both set the SID cookie
         if body not in (b"Ok.", b"") or not any(c.name.endswith("SID") or "SID_" in c.name for c in self.jar):
             raise RuntimeError("qBittorrent login failed (check QBIT_USER / QBIT_PASS)")
 
-    def _req(self, path, data=None, headers=None, raw=False):
+    def _req(self, path, data=None, headers=None, raw=False, retry=True):
+        """One API call. A timed-out call is tried again (RETRIES attempts) unless retry=False:
+        qBittorrent stops answering while it hash-checks, which is not an error."""
         h = {"Referer": self.url, "User-Agent": USER_AGENT}
         h.update(headers or {})
         if isinstance(data, dict):
             data = urllib.parse.urlencode(data).encode()
-        req = urllib.request.Request(self.url + path, data=data, headers=h)
-        with self.opener.open(req, timeout=60) as r:
-            body = r.read()
+        attempts = self.RETRIES if retry else 1
+        for attempt in range(1, attempts + 1):
+            req = urllib.request.Request(self.url + path, data=data, headers=h)
+            try:
+                with self.opener.open(req, timeout=self.timeout) as r:
+                    body = r.read()
+                break
+            except Exception as e:
+                if not is_timeout(e) or attempt == attempts:
+                    raise
+                log.warning("qBittorrent did not answer %s within %ss (busy?), trying again (%d/%d)",
+                            path, self.timeout, attempt + 1, attempts)
+                time.sleep(10)
         return body if raw else (json.loads(body) if body.strip() else None)
+
+    def wait_for(self, h, seconds):
+        """The torrent's info once qBittorrent lists it, or None after `seconds`."""
+        deadline = time.time() + seconds
+        while True:
+            found = self.torrents(h)
+            if found:
+                return found[0]
+            if time.time() > deadline:
+                return None
+            time.sleep(15)
 
     def torrents(self, hashes=None):
         q = "?" + urllib.parse.urlencode({"hashes": hashes}) if hashes else ""
@@ -365,7 +399,8 @@ class QBit:
                      f'filename="twin.torrent"\r\nContent-Type: application/x-bittorrent\r\n\r\n'.encode()
                      + torrent_bytes + b"\r\n")
         parts.append(f"--{boundary}--\r\n".encode())
-        body = self._req("/api/v2/torrents/add", data=b"".join(parts), raw=True,
+        # never sent twice: a timed-out add may still have been accepted (inject_twin checks)
+        body = self._req("/api/v2/torrents/add", data=b"".join(parts), raw=True, retry=False,
                          headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         if not add_accepted(body):
             raise RuntimeError(f"qBittorrent refused the torrent: {body[:200]!r}")
@@ -525,14 +560,8 @@ def run_once(cfg, qb, db):
                 outcome = "match"
                 log.info("[%s] MATCH %s", target, src["name"])
                 if cfg.mode == "inject":
-                    category = cfg.category or src.get("category", "")
-                    qb.add_stopped(data, src["save_path"], category, cfg.tag)
-                    time.sleep(2)
-                    apply_seed_limits(cfg, qb, seed_limits, target, url, h, files)
-                    qb.recheck(h)
+                    inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files)
                     known.add(h)
-                    db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
-                               (h, src["hash"], target, src["name"], now(), "checking"))
                     added += 1
                 break
             db.execute("INSERT OR REPLACE INTO searches VALUES (?,?,?,?,?)",
@@ -543,16 +572,55 @@ def run_once(cfg, qb, db):
     return {"sources": len(sources), "searches": searches, "matches": found, "added": added}
 
 
+def inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files):
+    """Add a matched twin stopped, give it its seed limits, recheck it and record it.
+
+    An add that times out may still have been accepted (qBittorrent busy hash-checking):
+    wait for the twin to show up and finish it the same way, so it is never left
+    stopped, unchecked and unrecorded."""
+    category = cfg.category or src.get("category", "")
+    try:
+        qb.add_stopped(data, src["save_path"], category, cfg.tag)
+    except Exception as e:
+        if not is_timeout(e):
+            raise
+        log.warning("[%s] qBittorrent did not answer the add in time; waiting for the twin to appear", target)
+        if qb.wait_for(h, cfg.qbit_timeout) is None:
+            raise
+        log.info("[%s] twin appeared after all, finishing it", target)
+    time.sleep(2)
+    apply_seed_limits(cfg, qb, seed_limits, target, url, h, files)
+    qb.recheck(h)
+    db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
+               (h, src["hash"], target, src["name"], now(), "checking"))
+    db.commit()
+
+
+def limits_applied(info, ratio, minutes):
+    """True when qBittorrent reports these per-torrent limits for the torrent."""
+    return (abs(float(info.get("ratio_limit", -9)) - float(ratio)) < 0.001
+            and int(info.get("seeding_time_limit", -9)) == int(minutes))
+
+
 def apply_seed_limits(cfg, qb, cache, target, url, h, files):
     """Give a new twin the seed ratio/time its Prowlarr indexer has; on any error the twin
-    keeps qBittorrent's global limits (logged, never fatal)."""
+    keeps qBittorrent's global limits (logged, never fatal). The limits are read back:
+    a change sent while qBittorrent was busy can be lost, so it is sent once more."""
     try:
         if target not in cache:
             cache[target] = prowlarr_seed_limits(cfg, url)
         limits = share_limits_for(cache[target], files)
         if limits:
-            qb.set_share_limits(h, *limits)
-            log.info("[%s] seed limits ratio %s / %s min", target, *limits)
+            for _ in range(2):
+                qb.set_share_limits(h, *limits)
+                time.sleep(2)
+                info = qb.torrents(h)
+                if info and limits_applied(info[0], *limits):
+                    log.info("[%s] seed limits ratio %s / %s min", target, *limits)
+                    break
+            else:
+                log.warning("[%s] seed limits ratio %s / %s min did not stick (global limits apply)",
+                            target, *limits)
     except Exception as e:
         log.warning("[%s] could not set seed limits (global limits apply): %s", target, redact(str(e)))
 
@@ -652,7 +720,7 @@ def do_run(trigger):
         probs = cfg.problems()
         if probs:
             raise RuntimeError("not set up: " + "; ".join(probs))
-        qb = QBit(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass)
+        qb = QBit(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass, cfg.qbit_timeout)
         settle_checks(cfg, qb, c)  # twins left checking by an earlier run
         try:
             st = run_once(cfg, qb, c)
@@ -710,7 +778,7 @@ def prowlarr_indexers(cfg):
 
 def tracker_hosts(cfg):
     """{host: number of completed torrents} from qBittorrent's working tracker per torrent."""
-    qb = QBit(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass)
+    qb = QBit(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass, cfg.qbit_timeout)
     counts = {}
     for t in qb.torrents():
         host = (urllib.parse.urlsplit(t.get("tracker") or "").hostname or "").lower()

@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-26
+
+### Fixed
+
+- qBittorrent can stop answering its API for minutes while it hash-checks a big file, so every run failed with "timed out" part-way and later torrents were never searched. Twinarr now waits up to `QBIT_TIMEOUT` (300 s) per call and asks again (3 attempts) when qBittorrent is busy.
+- A torrent add that timed out could still have been accepted, leaving a twin stopped at 0% with no seed limits, no data check and no record in Twinarr. Twinarr now waits for the twin to appear and finishes it (seed limits, recheck, record); an add is never sent twice.
+- Seed limits sent while qBittorrent was busy could be lost. They are now read back and sent once more if they did not stick.
+
+### Added
+
+- `QBIT_TIMEOUT` setting (seconds per qBittorrent call, default 300).
+
 ## [0.3.3] - 2026-11-24
 
 ### Fixed
