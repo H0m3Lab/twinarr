@@ -4,7 +4,7 @@
 Every day Twinarr lists the torrents qBittorrent is seeding from your *source* trackers,
 searches your *target* Torznab indexers for the identical release, and adds each exact
 match to qBittorrent pointing at the files you already have. qBittorrent verifies the
-data before anything seeds. Python standard library only.
+data before anything seeds (or, with VERIFY=spot, Twinarr hashes sample pieces itself). Python standard library only.
 
 By H0m3Lab - MIT license.
 """
@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.4"
+VERSION = "0.4.0"
 USER_AGENT = f"Twinarr/{VERSION}"
 SEEDING_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP"}
 CHECKING_STATES = {"checkingUP", "checkingDL", "checkingResumeData", "moving", "allocating", "metaDL"}
@@ -62,6 +62,28 @@ def parse_targets(raw):
             raise ValueError(f"bad TARGETS entry: {part!r}")
         out.append((name, url))
     return out
+
+
+def parse_path_map(raw):
+    """DATA_PATH_MAP = "/qbit/path=/twinarr/path, ..." -> [(qbit_prefix, local_prefix)], longest first."""
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"DATA_PATH_MAP entry needs 'qbit_path=local_path': {part!r}")
+        a, b = (x.strip().rstrip("/") for x in part.split("=", 1))
+        out.append((a, b))
+    return sorted(out, key=lambda p: -len(p[0]))
+
+
+def map_path(path, path_map):
+    """qBittorrent's path for a file -> the same file as Twinarr sees it."""
+    for a, b in path_map:
+        if path == a or path.startswith(a + "/"):
+            return b + path[len(a):]
+    return path
 
 
 def valid_time(s):
@@ -103,6 +125,14 @@ class Config:
         self.check_timeout = int(env("CHECK_TIMEOUT", "1800"))
         # qBittorrent can stop answering for minutes while it hash-checks a big file
         self.qbit_timeout = int(env("QBIT_TIMEOUT", "300"))
+        # full (default) = qBittorrent checks all the data before a twin starts.
+        # spot = Twinarr hashes a few sample pieces itself (needs the data mounted read-only); if they
+        # match, the twin is added with "skip hash check" and starts at once, so qBittorrent never
+        # re-reads a big file (it can stop answering for minutes while it does).
+        self.verify = env("VERIFY", "full").lower()
+        if self.verify not in ("spot", "full"):
+            raise ValueError("VERIFY must be 'spot' or 'full'")
+        self.path_map = parse_path_map(env("DATA_PATH_MAP"))
         self.data_dir = env("DATA_DIR", "/data")
         self.ui_port = int(env("UI_PORT", "8383"))
         self.ui_password = env("UI_PASSWORD")
@@ -185,6 +215,76 @@ def torrent_files(meta):
 
 def infohash(info_bytes):
     return hashlib.sha1(info_bytes).hexdigest()
+
+
+# --------------------------------------------------------------------------- spot check
+
+SPOT_PIECES = 8  # sample pieces read per twin: first, last and evenly spread in between
+RECHECK_GRACE = 900  # seconds a just-requested recheck may sit queued before 0% counts as a result
+
+
+def piece_plan(meta):
+    """(piece_length, [sha1 per piece], [(relative/path or None for padding, length)]) in torrent order."""
+    info = meta[b"info"]
+    raw = info[b"pieces"]
+    hashes = [raw[i:i + 20] for i in range(0, len(raw), 20)]
+    name = _text(info.get(b"name.utf-8", info[b"name"]))
+    if b"files" not in info:
+        return int(info[b"piece length"]), hashes, [(name, int(info[b"length"]))]
+    files = []
+    for f in info[b"files"]:
+        parts = f.get(b"path.utf-8", f[b"path"])
+        pad = f.get(b"attr", b"").find(b"p") >= 0 or (parts and _text(parts[-1]).startswith(".pad"))
+        files.append((None if pad else "/".join([name] + [_text(p) for p in parts]), int(f[b"length"])))
+    return int(info[b"piece length"]), hashes, files
+
+
+def spot_pieces(n, count=SPOT_PIECES):
+    if n <= count:
+        return list(range(n))
+    return sorted({round(i * (n - 1) / (count - 1)) for i in range(count)})
+
+
+def read_piece(base, files, plen, idx):
+    """The bytes of piece ``idx`` read from the files under ``base`` (padding = zero bytes)."""
+    start = idx * plen
+    end = min(start + plen, sum(length for _, length in files))
+    out, off = bytearray(), 0
+    for rel, length in files:
+        fs, fe = off, off + length
+        off = fe
+        if fe <= start or fs >= end:
+            continue
+        a, b = max(start, fs) - fs, min(end, fe) - fs
+        if rel is None:
+            out += bytes(b - a)
+            continue
+        with open(os.path.join(base, rel), "rb") as fh:
+            fh.seek(a)
+            chunk = fh.read(b - a)
+        if len(chunk) != b - a:
+            raise OSError(f"short read in {rel}")
+        out += chunk
+    return bytes(out)
+
+
+def spot_check(meta, save_path, path_map=(), count=SPOT_PIECES):
+    """Hash a few sample pieces of the new .torrent against the files already on disk.
+
+    True = every sample matches, False = a sample differs (not the same data),
+    None = the files can't be read here (not mounted, other size) -> let qBittorrent check."""
+    base = map_path(save_path.rstrip("/"), path_map)
+    try:
+        plen, hashes, files = piece_plan(meta)
+        for rel, length in files:
+            if rel is not None and os.path.getsize(os.path.join(base, rel)) != length:
+                return None
+        for i in spot_pieces(len(hashes), count):
+            if hashlib.sha1(read_piece(base, files, plen, i)).digest() != hashes[i]:
+                return False
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+    return True
 
 
 # --------------------------------------------------------------------------- matching
@@ -387,10 +487,10 @@ class QBit:
     def files(self, h):
         return {f["name"]: int(f["size"]) for f in self._req("/api/v2/torrents/files?hash=" + h)}
 
-    def add_stopped(self, torrent_bytes, savepath, category, tags):
+    def add_stopped(self, torrent_bytes, savepath, category, tags, skip_checking=False):
         boundary = uuid.uuid4().hex
         fields = {"savepath": savepath, "category": category, "tags": tags,
-                  "paused": "true", "stopped": "true", "skip_checking": "false",
+                  "paused": "true", "stopped": "true", "skip_checking": "true" if skip_checking else "false",
                   "autoTMM": "false", "contentLayout": "Original", "root_folder": "true"}
         parts = []
         for k, v in fields.items():
@@ -407,6 +507,7 @@ class QBit:
 
     def recheck(self, h):
         self._req("/api/v2/torrents/recheck", data={"hashes": h}, raw=True)
+        RECHECKED[h.lower()] = time.time()
 
     def start(self, h):
         try:
@@ -559,8 +660,7 @@ def run_once(cfg, qb, db):
                 found += 1
                 outcome = "match"
                 log.info("[%s] MATCH %s", target, src["name"])
-                if cfg.mode == "inject":
-                    inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files)
+                if cfg.mode == "inject" and inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files):
                     known.add(h)
                     added += 1
                 break
@@ -574,13 +674,33 @@ def run_once(cfg, qb, db):
 
 def inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files):
     """Add a matched twin stopped, give it its seed limits, recheck it and record it.
+    Returns True when the twin was added.
+
+    VERIFY=spot: sample pieces are hashed against the files on disk first. All match ->
+    the twin is added with skip_checking and started at once (no full re-read by
+    qBittorrent). A sample differs -> not added, recorded as a mismatch. Files not
+    readable here -> the normal full check.
 
     An add that times out may still have been accepted (qBittorrent busy hash-checking):
     wait for the twin to show up and finish it the same way, so it is never left
     stopped, unchecked and unrecorded."""
     category = cfg.category or src.get("category", "")
+    verified = None
+    if cfg.verify == "spot":
+        try:
+            verified = spot_check(bdecode(data)[0], src["save_path"], cfg.path_map)
+        except ValueError:
+            verified = None
+        if verified is False:
+            db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
+                       (h, src["hash"], target, src["name"], now(), "mismatch"))
+            db.commit()
+            log.warning("[%s] sample pieces differ from the files on disk, NOT added: %s", target, src["name"])
+            return False
+        if verified is None:
+            log.info("[%s] files not readable for a spot check, qBittorrent checks them all", target)
     try:
-        qb.add_stopped(data, src["save_path"], category, cfg.tag)
+        qb.add_stopped(data, src["save_path"], category, cfg.tag, skip_checking=bool(verified))
     except Exception as e:
         if not is_timeout(e):
             raise
@@ -590,10 +710,22 @@ def inject_twin(cfg, qb, db, seed_limits, target, url, src, data, h, files):
         log.info("[%s] twin appeared after all, finishing it", target)
     time.sleep(2)
     apply_seed_limits(cfg, qb, seed_limits, target, url, h, files)
+    if verified:
+        info = qb.torrents(h)
+        if info and float(info[0].get("progress", 0)) >= 1:  # never start below 100%
+            qb.start(h)
+            db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
+                       (h, src["hash"], target, src["name"], now(), "seeding"))
+            db.commit()
+            log.info("[%s] %d sample pieces match the files on disk, seeding without a full check: %s",
+                     target, SPOT_PIECES, src["name"])
+            return True
+        log.warning("[%s] skip-check add is not at 100%%, qBittorrent checks it all: %s", target, src["name"])
     qb.recheck(h)
     db.execute("INSERT OR REPLACE INTO twins VALUES (?,?,?,?,?,?)",
                (h, src["hash"], target, src["name"], now(), "checking"))
     db.commit()
+    return True
 
 
 def limits_applied(info, ratio, minutes):
@@ -629,8 +761,12 @@ def settle_checks(cfg, qb, db):
     """Start twins that verified 100%; leave the rest stopped and tag them.
 
     A twin below 100% gets ONE more recheck before it counts as a mismatch: a recheck
-    request can be lost (qBittorrent restarted or busy), which leaves a good twin at 0%."""
+    request can be lost (qBittorrent restarted or busy), which leaves a good twin at 0%.
+    A twin whose recheck was asked for moments ago is not judged until qBittorrent has
+    actually checked it: a queued check still shows the old 0% (2026-11-27 a good 35 GB
+    twin was called a mismatch 15 s after its recheck)."""
     deadline = time.time() + cfg.check_timeout
+    seen_checking = set()
     while True:
         status = dict(db.execute("SELECT twin_hash, status FROM twins WHERE status IN ('checking','rechecking')"))
         pending = list(status)
@@ -642,7 +778,11 @@ def settle_checks(cfg, qb, db):
             if t is None:
                 db.execute("UPDATE twins SET status='gone' WHERE twin_hash=?", (h,))
             elif t["state"] in CHECKING_STATES:
+                seen_checking.add(h)
                 continue
+            elif (t.get("progress", 0) <= 0 and h not in seen_checking
+                  and time.time() - RECHECKED.get(h, 0) < RECHECK_GRACE):
+                continue  # check asked for but not started yet (queued behind another check)
             elif t.get("progress", 0) >= 1:
                 qb.start(h)
                 db.execute("UPDATE twins SET status='seeding' WHERE twin_hash=?", (h,))
@@ -688,6 +828,7 @@ def status(db):
 # --------------------------------------------------------------------------- runner + scheduler
 
 DB_PATH = None
+RECHECKED = {}  # twin hash -> time a recheck was asked for (this process)
 RUN_LOCK = threading.Lock()
 RUNNING = {"since": None}
 

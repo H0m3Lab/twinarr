@@ -268,8 +268,10 @@ class InjectQB:
         self.lost = lost_limit_sets
         self.limit_sets = self.rechecks = 0
         self.limits = (-2, -2)
+        self.skip, self.progress, self.started = None, 0.0, 0
 
-    def add_stopped(self, *a):
+    def add_stopped(self, *a, skip_checking=False):
+        self.skip = skip_checking
         if self.add_times_out:
             raise TimeoutError("timed out")
 
@@ -277,7 +279,11 @@ class InjectQB:
         return {"hash": h} if self.appears else None
 
     def torrents(self, hashes=None):
-        return [{"hash": "aa", "ratio_limit": self.limits[0], "seeding_time_limit": self.limits[1]}]
+        return [{"hash": "aa", "ratio_limit": self.limits[0], "seeding_time_limit": self.limits[1],
+                 "progress": self.progress}]
+
+    def start(self, h):
+        self.started += 1
 
     def set_share_limits(self, h, ratio, minutes):
         self.limit_sets += 1
@@ -327,6 +333,135 @@ class InjectTwin(unittest.TestCase):
         qb = InjectQB(lost_limit_sets=1)
         self.inject(qb)
         self.assertEqual((qb.limit_sets, qb.limits), (2, (1.0, 4320)))
+
+
+def make_torrent(files, plen=64):
+    """files = [(name parts or None for padding, bytes)] -> (meta dict for benc, {path: bytes})."""
+    blob = b"".join(d for _, d in files)
+    pieces = b"".join(hashlib.sha1(blob[i:i + plen]).digest() for i in range(0, len(blob), plen))
+    info = {"name": "Movie.2026.1080p-GRP", "piece length": plen, "pieces": pieces, "files": []}
+    disk = {}
+    for parts, data in files:
+        if parts is None:
+            info["files"].append({"length": len(data), "path": [".pad", str(len(data))], "attr": "p"})
+        else:
+            info["files"].append({"length": len(data), "path": parts})
+            disk["/".join(["Movie.2026.1080p-GRP"] + parts)] = data
+    return {"info": info}, disk
+
+
+class SpotCheck(unittest.TestCase):
+    FILES = [(["Movie.mkv"], bytes(range(256)) * 5), (None, b"\0" * 20), (["Subs", "en.srt"], b"subtitle " * 30)]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        meta, disk = make_torrent(self.FILES)
+        self.meta = t.bdecode(benc(meta))[0]
+        for rel, data in disk.items():
+            path = os.path.join(self.tmp.name, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        self.disk = disk
+
+    def test_same_data_passes(self):
+        self.assertTrue(t.spot_check(self.meta, self.tmp.name, count=100))  # every piece, across file + pad edges
+
+    def test_changed_byte_fails(self):
+        path = os.path.join(self.tmp.name, "Movie.2026.1080p-GRP", "Movie.mkv")
+        with open(path, "r+b") as f:
+            f.seek(0)
+            f.write(b"\xff")
+        self.assertIs(t.spot_check(self.meta, self.tmp.name), False)
+
+    def test_missing_or_other_size_is_unknown(self):
+        self.assertIsNone(t.spot_check(self.meta, os.path.join(self.tmp.name, "elsewhere")))
+        with open(os.path.join(self.tmp.name, "Movie.2026.1080p-GRP", "Subs", "en.srt"), "ab") as f:
+            f.write(b"x")
+        self.assertIsNone(t.spot_check(self.meta, self.tmp.name))
+
+    def test_path_map(self):
+        pm = t.parse_path_map("/media/movies=" + self.tmp.name)
+        self.assertTrue(t.spot_check(self.meta, "/media/movies", pm))
+        self.assertEqual(t.map_path("/media/moviesX/a", pm), "/media/moviesX/a")
+
+    def test_sample_spread(self):
+        self.assertEqual(t.spot_pieces(3, 8), [0, 1, 2])
+        got = t.spot_pieces(1000, 8)
+        self.assertEqual((len(got), got[0], got[-1]), (8, 0, 999))
+
+
+class SpotInject(unittest.TestCase):
+    """VERIFY=spot: a twin whose samples match is added with skip_checking and started, no recheck."""
+    def run_inject(self, tamper=False, progress=1.0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        meta, disk = make_torrent([(["Movie.mkv"], os.urandom(1000))])
+        for rel, data in disk.items():
+            os.makedirs(os.path.join(tmp.name, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(tmp.name, rel), "wb") as f:
+                f.write(b"\0" * len(data) if tamper else data)
+        qb = InjectQB()
+        qb.progress = progress
+        db = t.open_db(":memory:")
+        cfg = t.Config({})
+        cfg.verify = "spot"
+        src = {"hash": "bb", "name": "Movie.2026", "save_path": tmp.name, "category": "movies"}
+        orig, t.time.sleep = t.time.sleep, lambda s: None
+        try:
+            with self.assertLogs("twinarr", level="INFO"):
+                added = t.inject_twin(cfg, qb, db, {"SiteA": (1.0, 4320, 4320)}, "SiteA",
+                                      "http://idx.example/1/api", src, benc(meta), "aa", {"Movie.mkv": 1000})
+        finally:
+            t.time.sleep = orig
+        return added, qb, db.execute("SELECT status FROM twins").fetchall()
+
+    def test_match_starts_without_recheck(self):
+        added, qb, rows = self.run_inject()
+        self.assertEqual((added, qb.skip, qb.rechecks, qb.started, rows), (True, True, 0, 1, [("seeding",)]))
+
+    def test_mismatch_is_never_added(self):
+        added, qb, rows = self.run_inject(tamper=True)
+        self.assertEqual((added, qb.skip, qb.started, rows), (False, None, 0, [("mismatch",)]))
+
+    def test_not_100_falls_back_to_full_check(self):
+        added, qb, rows = self.run_inject(progress=0.0)
+        self.assertEqual((added, qb.rechecks, qb.started, rows), (True, 1, 0, [("checking",)]))
+
+
+class QueuedRecheck(unittest.TestCase):
+    def test_queued_recheck_is_not_a_mismatch(self):
+        """The recheck sits queued (still 0%, not 'checking') for a few polls, then verifies."""
+        class SlowQB(FakeQB):
+            polls = 0
+
+            def recheck(self, h):
+                self.rechecks += 1
+                t.RECHECKED[h] = t.time.time()
+                self.polls = 3
+
+            def torrents(self, hashes=None):
+                if self.polls:
+                    self.polls -= 1
+                    if not self.polls:
+                        self.progress = 1.0
+                return super().torrents(hashes)
+
+        db = t.open_db(":memory:")
+        db.execute("INSERT INTO twins VALUES ('aa','bb','SiteA','Show.S01E01','2026-01-01T00:00:00','checking')")
+        qb = SlowQB([0.0])
+        cfg = t.Config({})
+        cfg.check_timeout = 60
+        orig, t.time.sleep = t.time.sleep, lambda s: None
+        try:
+            with self.assertLogs("twinarr", level="INFO"):
+                t.settle_checks(cfg, qb, db)
+        finally:
+            t.time.sleep = orig
+            t.RECHECKED.clear()
+        self.assertEqual((db.execute("SELECT status FROM twins").fetchone()[0], qb.rechecks, qb.started),
+                         ("seeding", 1, 1))
 
 
 class Config(unittest.TestCase):

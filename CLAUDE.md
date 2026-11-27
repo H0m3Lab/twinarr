@@ -19,7 +19,9 @@ One file, `twinarr.py`:
 - `QBit`: qBittorrent WebUI API v2 client (login, list, files, trackers, add, recheck, start, tags).
 - `run_once`: pick sources (`pick_sources`) → query (`search_query`) → size pre-filter (`size_close`) →
   fetch `.torrent` → strict file compare (`files_match`) → add stopped + recheck (inject mode).
-- `settle_checks`: starts twins that verified 100%, tags the rest `<TAG>-mismatch` and leaves them stopped.
+- `spot_check` / `piece_plan` / `read_piece`: `VERIFY=spot` sample-piece hashing against the files on disk.
+- `settle_checks`: starts twins that verified 100%, tags the rest `<TAG>-mismatch` and leaves them stopped
+  (a just-requested recheck that is still queued is not judged before `RECHECK_GRACE`).
 - `do_run`: one guarded pass (`RUN_LOCK`), recorded in the `runs` table; `scheduler` thread fires it at
   the saved run time; the web **Run now** button starts it in a thread.
 - Web UI (`Web`, `ThreadingHTTPServer`, port `UI_PORT` 8383): `status_page`, `settings_page` /
@@ -75,7 +77,12 @@ or change one: update both, give it a safe default, and add a CHANGELOG line.
 - Never add a torrent that is not a strict file-list match.
 - Always add **stopped** with `skip_checking=false` and force a recheck; start only at 100% progress.
   A twin that is not 100% must stay stopped, otherwise qBittorrent would download into the user's files.
-- Never delete, move, rename or recheck the **source** torrent, and never touch files on disk.
+  The ONE exception is the opt-in `VERIFY=spot` (0.4.0, owner decision): `spot_check` must hash sample
+  pieces True against the files on disk before `skip_checking=true` is used, and the twin still starts
+  only when qBittorrent reports 100%. A failed sample = never added; unreadable files = full recheck.
+  Keep `full` the default.
+- Never delete, move, rename or recheck the **source** torrent, and never write files on disk
+  (`VERIFY=spot` only opens them read-only).
 - `twinarr.db` is history only; schema changes are new `CREATE TABLE IF NOT EXISTS` / migration steps.
 
 ## Security

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+### Added
+
+- `VERIFY=spot` (opt-in; default stays `full`): Twinarr hashes 8 sample pieces of a matched twin against the files on disk. All match -> the twin is added with "skip hash check" and starts at once, so qBittorrent never re-reads a big file (a 35 GB recheck kept qBittorrent's API frozen for over an hour). A sample that differs -> not added, recorded as a mismatch. Files not readable -> the normal full check. Needs the data mounted read-only.
+- `DATA_PATH_MAP` for `VERIFY=spot` when Twinarr sees the files under other paths than qBittorrent.
+
+### Fixed
+
+- A twin whose recheck was still queued (0%, not yet "checking") was judged 15 s later and wrongly tagged as a mismatch. Twinarr now waits up to 15 minutes for a requested check to actually run before it judges a 0% twin.
+
 ## [0.3.4] - 2026-11-26
 
 ### Fixed

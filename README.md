@@ -15,6 +15,8 @@ Every day Twinarr:
    data check,
 5. starts it only if the check says 100%. Anything else stays stopped and gets the tag
    `twinarr-mismatch`, so qBittorrent never downloads a single byte.
+   With `VERIFY=spot`, Twinarr hashes 8 sample pieces against your files itself instead; if they all
+   match, the twin is added with "skip hash check" and starts at once (see below).
 6. gives the twin the seed limits of the Prowlarr indexer it came from (seed ratio, seed time, pack seed
    time), so qBittorrent stops it at that site's rule. Empty values, and targets that aren't Prowlarr
    indexers, use qBittorrent's global limits.
@@ -61,6 +63,7 @@ Values saved on the settings page (run time, mode, main trackers, reseed-to site
 - qBittorrent 4.4 or newer with the WebUI on (tested on 5.x).
 - Twinarr reaches qBittorrent and your indexers over the network. It does **not** need your media
   mounted: the new torrent uses the source torrent's save path, and qBittorrent reads the files.
+  Only `VERIFY=spot` reads files, and then only read-only.
 - Your qBittorrent default content layout should be **Original** (the default). Twinarr compares
   paths the way qBittorrent lists them.
 
@@ -82,6 +85,8 @@ Values saved on the settings page (run time, mode, main trackers, reseed-to site
 | `TAG` | `twinarr` | Tag on every added torrent; failed checks get `<TAG>-mismatch` |
 | `INJECT_CATEGORY` | empty | Category for added torrents. Empty = same category as the source torrent |
 | `CHECK_TIMEOUT` | `1800` | Seconds to wait for data checks after a run; leftovers are settled on the next run |
+| `VERIFY` | `full` | `full` = qBittorrent checks all data before a twin starts; `spot` = Twinarr checks 8 sample pieces and starts matching twins without a full re-read (needs the data mounted read-only, see "How matching works") |
+| `DATA_PATH_MAP` | empty | Only for `VERIFY=spot` when Twinarr sees the files under other paths than qBittorrent: `/qbit/path=/twinarr/path`, comma separated |
 | `QBIT_TIMEOUT` | `300` | Seconds to wait for each qBittorrent answer; a call that times out is tried 3 times (qBittorrent can stop answering for minutes while it checks a big file) |
 | `DATA_DIR` | `/data` | Where `twinarr.db` lives |
 | `LOG_LEVEL` | `INFO` | Python log level |
@@ -101,7 +106,17 @@ TORZNAB_APIKEY=your-prowlarr-api-key
 - Results whose size is more than 1% off are skipped without downloading anything.
 - For the rest, the `.torrent` is fetched and its files (BEP 47 padding files ignored) must equal the
   source torrent's files exactly: same relative paths, same sizes.
-- qBittorrent's own data check is the final word: it must reach 100% before the twin starts.
+- `VERIFY=full` (default): qBittorrent's own data check is the final word; it must reach 100% before
+  the twin starts.
+- `VERIFY=spot`: qBittorrent can stop answering its API for many minutes while it re-reads a big file
+  (seen with a 35 GB remux on an Unraid user share). With `spot`, Twinarr reads 8 sample pieces (first,
+  last and spread between) from the files on disk and compares them with the new `.torrent`'s piece
+  hashes. All match -> added with skip_checking and started, no full re-read. One differs -> not added,
+  recorded as a mismatch. Files not readable -> the normal full check. Needs the data mounted
+  **read-only** in the Twinarr container at the paths qBittorrent uses (or `DATA_PATH_MAP`).
+  Trade-off: only samples are compared. A twin with the same names and byte sizes but different data
+  elsewhere would seed bad pieces, and a later forced recheck of it could download into your files.
+  Strict name + size matching makes that very unlikely; choose `full` if you want certainty.
 
 ## Be a good citizen
 

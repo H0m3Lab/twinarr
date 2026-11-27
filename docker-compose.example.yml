@@ -17,5 +17,8 @@ services:
       PROWLARR_URL: http://prowlarr:9696   # lets the settings page list your indexers
     volumes:
       - /path/to/appdata/twinarr:/data   # twinarr.db (search history; small)
+      # only for VERIFY=spot: your data READ-ONLY, at the same paths qBittorrent uses
+      # - /path/to/media:/media:ro
+      # - /path/to/downloads:/downloads:ro
     # put it on the same Docker network as qBittorrent and your indexer manager
     # networks: [media]
